@@ -91,9 +91,40 @@ if __name__ == '__main__':
         mask = imageio.imread(args.foreground_mask_path)[..., -1]  # rgba image, take the alpha channel
         mask = cv2.resize(mask, dsize=(w, h)) == 255
 
+    if args.query_pts_source == 'keypoints' and (trainer.with_keypoints or os.path.exists(args.query_keypoint_path)):
+        if os.path.exists(args.query_keypoint_path):
+            query_pts, _ = util.load_query_points(args.query_keypoint_path,
+                                                  num_joints=args.num_joints,
+                                                  keypoint_format=args.keypoint_format,
+                                                  min_conf=args.min_keypoint_conf)
+            if len(query_pts) == 0:
+                raise ValueError('No valid query keypoints found in {}'.format(args.query_keypoint_path))
+            frames, kpts = trainer.eval_video_correspondences(query_id,
+                                                              pts=query_pts,
+                                                              num_pts=len(query_pts),
+                                                              vis_occlusion=args.vis_occlusion,
+                                                              occlusion_th=args.occlusion_th,
+                                                              use_max_loc=args.use_max_loc,
+                                                              radius=radius,
+                                                              return_kpts=True,
+                                                              rolling_query=args.rolling_query)
+        else:
+            frames, kpts = trainer.eval_video_correspondences(query_id,
+                                                              vis_occlusion=args.vis_occlusion,
+                                                              occlusion_th=args.occlusion_th,
+                                                              use_max_loc=args.use_max_loc,
+                                                              radius=radius,
+                                                              return_kpts=True,
+                                                              use_keypoints=True,
+                                                              rolling_query=args.rolling_query or args.query_pts_source == 'keypoints')
+        imageio.mimwrite(os.path.join(vis_dir, '{}_{:06d}_keypoints_{}.mp4'.format(seq_name, trainer.step, query_id)),
+                         frames, quality=8, fps=10)
+        np.save(os.path.join(vis_dir, '{}_{:06d}_keypoints_{}.npy'.format(seq_name, trainer.step, query_id)),
+                kpts.cpu().numpy())
+
     # for DAVIS video sequences which come with segmentation masks
     # or when a foreground mask for the query frame is provided
-    if trainer.with_mask or mask is not None:
+    elif trainer.with_mask or mask is not None:
         # foreground
         frames, kpts_forground = trainer.eval_video_correspondences(query_id, use_mask=True,
                                                                     mask=mask,

@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import os, sys, time
 import imageio
@@ -106,6 +107,112 @@ def gen_grid_np(h, w, normalize=False, homogeneous=False):
     return grid  # [h, w, 2 or 3]
 
 
+
+def _init_keypoint_arrays(num_joints):
+    points = np.zeros((num_joints, 2), dtype=np.float32)
+    confidence = np.zeros((num_joints,), dtype=np.float32)
+    valid = np.zeros((num_joints,), dtype=bool)
+    return points, confidence, valid
+
+
+def _load_labelme_keypoints(data, num_joints):
+    if num_joints is None:
+        max_label = -1
+        for shape in data.get('shapes', []):
+            if shape.get('shape_type') != 'point':
+                continue
+            try:
+                max_label = max(max_label, int(shape.get('label', -1)))
+            except (TypeError, ValueError):
+                continue
+        num_joints = max(max_label + 1, 0)
+
+    points, confidence, valid = _init_keypoint_arrays(num_joints)
+    for shape in data.get('shapes', []):
+        if shape.get('shape_type') != 'point' or not shape.get('points'):
+            continue
+        try:
+            idx = int(shape.get('label', -1))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= num_joints:
+            continue
+        pt = np.asarray(shape['points'][0], dtype=np.float32)
+        if pt.shape[0] != 2:
+            continue
+        points[idx] = pt
+        confidence[idx] = float(shape.get('score', shape.get('confidence', 1.0)))
+        valid[idx] = True
+    return points, confidence, valid
+
+
+def load_keypoints(path, num_joints=None, keypoint_format='auto', min_conf=0.0):
+    with open(path, 'r') as f:
+        data = json.load(f)
+
+    fmt = keypoint_format
+    if fmt == 'auto':
+        if isinstance(data, dict) and 'shapes' in data:
+            fmt = 'labelme_points'
+        elif isinstance(data, dict) and 'people' in data:
+            fmt = 'openpose'
+        elif isinstance(data, dict) and 'keypoints_xy' in data:
+            fmt = 'keypoints_xy'
+        elif isinstance(data, dict) and 'keypoints' in data:
+            fmt = 'keypoints'
+        else:
+            raise ValueError('Unsupported keypoint format in {}'.format(path))
+
+    if fmt == 'labelme_points':
+        points, confidence, valid = _load_labelme_keypoints(data, num_joints)
+        valid = valid & (confidence >= min_conf)
+        return points, confidence, valid
+
+    if fmt == 'openpose':
+        people = data.get('people', [])
+        if num_joints is None:
+            num_joints = 17
+        points, confidence, valid = _init_keypoint_arrays(num_joints)
+        if not people:
+            valid = valid & (confidence >= min_conf)
+            return points, confidence, valid
+        pose = np.asarray(people[0].get('pose_keypoints_2d', []), dtype=np.float32)
+        pose = pose.reshape(-1, 3) if pose.size else pose.reshape(0, 3)
+        n = min(len(pose), num_joints)
+        if n > 0:
+            points[:n] = pose[:n, :2]
+            confidence[:n] = pose[:n, 2]
+            valid[:n] = confidence[:n] > 0
+        valid = valid & (confidence >= min_conf)
+        return points, confidence, valid
+
+    if fmt in ('keypoints_xy', 'keypoints'):
+        pts = data.get('keypoints_xy', data.get('keypoints', []))
+        pts = np.asarray(pts, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[1] not in (2, 3):
+            raise ValueError('Expected [N,2] or [N,3] keypoints in {}'.format(path))
+        if num_joints is None:
+            num_joints = len(pts)
+        points, confidence, valid = _init_keypoint_arrays(num_joints)
+        n = min(len(pts), num_joints)
+        if n > 0:
+            points[:n] = pts[:n, :2]
+            if 'confidence' in data:
+                conf = np.asarray(data['confidence'], dtype=np.float32)
+                confidence[:min(len(conf), n)] = conf[:min(len(conf), n)]
+                valid[:min(len(conf), n)] = conf[:min(len(conf), n)] > 0
+            elif pts.shape[1] == 3:
+                confidence[:n] = pts[:n, 2]
+                valid[:n] = confidence[:n] > 0
+            else:
+                confidence[:n] = 1.0
+                valid[:n] = True
+        valid = valid & (confidence >= min_conf)
+        return points, confidence, valid
+
+    raise ValueError('Unknown keypoint format: {}'.format(fmt))
+
+
 def save_current_code(outdir):
     now = datetime.now()  # current date and time
     date_time = now.strftime("%m_%d-%H:%M:%S")
@@ -167,6 +274,12 @@ def drawMatches(img1, img2, kp1, kp2, num_vis=200, idx_vis=None, radius=2, mask=
     return out
 
 
+
+
+def load_query_points(path, num_joints=None, keypoint_format='auto', min_conf=0.0):
+    points, confidence, valid = load_keypoints(path, num_joints=num_joints, keypoint_format=keypoint_format, min_conf=min_conf)
+    keep = valid & (confidence >= min_conf)
+    return points[keep], confidence[keep]
 def get_vertical_colorbar(h, vmin, vmax, cmap_name='jet', label=None, cbar_precision=2):
     '''
     :param w: pixels

@@ -14,6 +14,7 @@ import util
 from criterion import masked_mse_loss, masked_l1_loss, compute_depth_range_loss, lossfun_distortion
 from networks.mfn import GaborNet
 from networks.nvp_simplified import NVPSimplified
+from networks.point_head import PointMLPHead
 from kornia import morphology as morph
 
 
@@ -61,15 +62,49 @@ class BaseTrainer():
                                   alpha=3,
                                   out_size=4).to(device)
 
-        self.optimizer = torch.optim.Adam([
+        self.use_point_head = bool(getattr(args, 'use_point_head', False))
+        if self.use_point_head:
+            self.point_use_rgb_patch = bool(getattr(args, 'point_use_rgb_patch', False))
+            self.point_use_dino_feature = bool(getattr(args, 'point_use_dino_feature', False))
+            self.point_use_dino_correlation = bool(getattr(args, 'point_use_dino_correlation', False))
+            point_rgb_patch_size = max(int(getattr(args, 'point_rgb_patch_size', 5)), 1)
+            if point_rgb_patch_size % 2 == 0:
+                point_rgb_patch_size += 1
+            self.point_rgb_patch_size = point_rgb_patch_size
+            rgb_feature_dim = 0
+            if self.point_use_rgb_patch:
+                rgb_feature_dim = 3 * self.point_rgb_patch_size * self.point_rgb_patch_size * 3
+            if self.point_use_dino_feature:
+                rgb_feature_dim += int(getattr(args, 'point_dino_dim', 384)) * 3
+            if self.point_use_dino_correlation:
+                corr_radius = max(int(getattr(args, 'point_corr_radius', 12)), 0)
+                corr_stride = max(int(getattr(args, 'point_corr_stride', 2)), 1)
+                corr_side = len(range(-corr_radius, corr_radius + 1, corr_stride))
+                rgb_feature_dim += corr_side * corr_side + 2
+            self.point_head = PointMLPHead(feature_dim=128,
+                                           hidden_dim=getattr(args, 'point_head_hidden', 256),
+                                           num_layers=getattr(args, 'point_head_layers', 3),
+                                           delta_scale=getattr(args, 'point_delta_scale', 0.25),
+                                           use_base_point=getattr(args, 'point_head_residual', True),
+                                           rgb_feature_dim=rgb_feature_dim).to(device)
+        else:
+            self.point_head = None
+
+        param_groups = [
             {'params': self.feature_mlp.parameters(), 'lr': args.lr_feature},
             {'params': self.deform_mlp.parameters(), 'lr': args.lr_deform},
             {'params': self.color_mlp.parameters(), 'lr': args.lr_color},
-        ])
+        ]
+        if self.use_point_head:
+            param_groups.append({'params': self.point_head.parameters(), 'lr': getattr(args, 'lr_point', args.lr_deform)})
+
+        self.optimizer = torch.optim.Adam(param_groups)
 
         self.learnable_params = list(self.feature_mlp.parameters()) + \
                                 list(self.deform_mlp.parameters()) + \
                                 list(self.color_mlp.parameters())
+        if self.use_point_head:
+            self.learnable_params += list(self.point_head.parameters())
 
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer,
                                                          step_size=args.lrate_decay_steps,
@@ -97,6 +132,12 @@ class BaseTrainer():
                 device_ids=[args.local_rank],
                 output_device=args.local_rank
             )
+            if self.use_point_head:
+                self.point_head = torch.nn.parallel.DistributedDataParallel(
+                    self.point_head,
+                    device_ids=[args.local_rank],
+                    output_device=args.local_rank
+                )
 
     def read_data(self):
         self.seq_dir = self.args.data_dir
@@ -110,6 +151,17 @@ class BaseTrainer():
         images = np.array([imageio.imread(img_file) / 255. for img_file in self.img_files])
         self.images = torch.from_numpy(images).float()  # [n_imgs, h, w, 3]
         self.h, self.w = self.images.shape[1:3]
+        self.point_dino_features = None
+        if bool(getattr(self.args, 'point_use_dino_feature', False)) or \
+                bool(getattr(self.args, 'point_use_dino_correlation', False)):
+            dino_dir = getattr(self.args, 'point_dino_dir', '') or os.path.join(self.seq_dir, 'features', 'dino')
+            dino_features = []
+            for img_file in self.img_files:
+                feat_path = os.path.join(dino_dir, os.path.basename(img_file) + '.npy')
+                if not os.path.exists(feat_path):
+                    raise FileNotFoundError('Missing DINO feature file: {}'.format(feat_path))
+                dino_features.append(torch.from_numpy(np.load(feat_path)).float())
+            self.point_dino_features = dino_features
 
         mask_files = [img_file.replace('color', 'mask').replace('.jpg', '.png') for img_file in self.img_files]
         if os.path.exists(mask_files[0]):
@@ -122,6 +174,37 @@ class BaseTrainer():
         else:
             self.masks = torch.ones(self.images.shape[:-1]).to(self.device) > 0.
             self.with_mask = False
+
+        self.keypoint_dir = getattr(self.args, 'keypoint_dir', '') or os.path.join(self.seq_dir, 'keypoints')
+        self.keypoints = None
+        self.keypoint_confidences = None
+        self.keypoint_valid = None
+        self.with_keypoints = False
+        if os.path.isdir(self.keypoint_dir):
+            keypoints = []
+            confidences = []
+            valid = []
+            keypoint_format = getattr(self.args, 'keypoint_format', 'auto')
+            num_joints = getattr(self.args, 'num_joints', 17)
+            for img_file in self.img_files:
+                stem = os.path.splitext(os.path.basename(img_file))[0]
+                keypoint_path = os.path.join(self.keypoint_dir, stem + '.json')
+                if os.path.exists(keypoint_path):
+                    points, conf, valid_mask = util.load_keypoints(keypoint_path,
+                                                                   num_joints=num_joints,
+                                                                   keypoint_format=keypoint_format)
+                else:
+                    points = np.zeros((num_joints, 2), dtype=np.float32)
+                    conf = np.zeros((num_joints,), dtype=np.float32)
+                    valid_mask = np.zeros((num_joints,), dtype=bool)
+                keypoints.append(points)
+                confidences.append(conf)
+                valid.append(valid_mask)
+            self.keypoints = torch.from_numpy(np.stack(keypoints)).float().to(self.device)
+            self.keypoint_confidences = torch.from_numpy(np.stack(confidences)).float().to(self.device)
+            self.keypoint_valid = torch.from_numpy(np.stack(valid)).bool().to(self.device)
+            self.with_keypoints = True
+
         self.grid = util.gen_grid(self.h, self.w, device=self.device, normalize=False, homogeneous=True).float()
 
     def project(self, x, return_depth=False):
@@ -374,6 +457,238 @@ class BaseTrainer():
         else:
             return px2s_pred, occlusion_score
 
+    def get_point_head_correspondences(self, ids1, px1s, ids2, return_conf=False, base_pred=None):
+        if not self.use_point_head:
+            raise ValueError('Point head is not enabled; pass --use_point_head to train/load it.')
+
+        original_shape = px1s.shape[:-1]
+        px1s_flat = px1s.reshape(-1, 2)
+        use_base = getattr(self.args, 'point_head_residual', True)
+        if use_base and base_pred is None:
+            with torch.no_grad():
+                if px1s.ndim == 2:
+                    base_pred = self.get_correspondences_for_pixels(ids1, px1s[:, None], ids2,
+                                                                    use_max_loc=getattr(self.args, 'use_max_loc', False))[:, 0]
+                else:
+                    base_pred = self.get_correspondences_for_pixels(ids1, px1s, ids2,
+                                                                    use_max_loc=getattr(self.args, 'use_max_loc', False))
+        if px1s.ndim == 3:
+            n_imgs, n_pts = px1s.shape[:2]
+            ids1_t = torch.as_tensor(ids1, dtype=torch.long, device=self.device).repeat_interleave(n_pts)
+            ids2_t = torch.as_tensor(ids2, dtype=torch.long, device=self.device).repeat_interleave(n_pts)
+        else:
+            ids1_t = torch.as_tensor(ids1, dtype=torch.long, device=self.device)
+            ids2_t = torch.as_tensor(ids2, dtype=torch.long, device=self.device)
+
+        point_base_pred = base_pred
+        corr_feat = None
+        if getattr(self, 'point_use_dino_correlation', False):
+            if point_base_pred is None:
+                raise ValueError('DINO correlation point head requires base_pred.')
+            corr_feat, corr_pred = self.get_dino_correlation_features(ids1_t, px1s_flat,
+                                                                      ids2_t, point_base_pred.reshape(-1, 2).detach())
+            if bool(getattr(self.args, 'point_corr_update_base', False)):
+                point_base_pred = corr_pred
+
+        base_norm = None
+        if use_base:
+            base_norm = util.normalize_coords(point_base_pred.reshape(-1, 2).detach(), self.h, self.w)
+
+        t_src = self.time_steps[ids1_t]
+        t_tgt = self.time_steps[ids2_t]
+        feat_src = self.feature_mlp(t_src)
+        feat_tgt = self.feature_mlp(t_tgt)
+        xy_norm = util.normalize_coords(px1s_flat, self.h, self.w)
+        rgb_feat = None
+        if getattr(self, 'point_use_rgb_patch', False):
+            if point_base_pred is None:
+                raise ValueError('RGB patch point head requires base_pred.')
+            src_patch = self.sample_rgb_patches(ids1_t, px1s_flat)
+            tgt_patch = self.sample_rgb_patches(ids2_t, point_base_pred.reshape(-1, 2).detach())
+            rgb_feat = torch.cat([src_patch, tgt_patch, tgt_patch - src_patch], dim=-1)
+        if getattr(self, 'point_use_dino_feature', False):
+            if point_base_pred is None:
+                raise ValueError('DINO point head requires base_pred.')
+            src_dino = self.sample_dino_features(ids1_t, px1s_flat)
+            tgt_dino = self.sample_dino_features(ids2_t, point_base_pred.reshape(-1, 2).detach())
+            dino_feat = torch.cat([src_dino, tgt_dino, tgt_dino - src_dino], dim=-1)
+            rgb_feat = dino_feat if rgb_feat is None else torch.cat([rgb_feat, dino_feat], dim=-1)
+        if corr_feat is not None:
+            rgb_feat = corr_feat if rgb_feat is None else torch.cat([rgb_feat, corr_feat], dim=-1)
+        pred_norm, conf_logit = self.point_head(xy_norm, t_src, t_tgt, feat_src, feat_tgt,
+                                                base_norm, rgb_feat)
+        pred = util.denormalize_coords(pred_norm, self.h, self.w).reshape(*original_shape, 2)
+        conf_logit = conf_logit.reshape(*original_shape, 1)
+        if return_conf:
+            return pred, conf_logit
+        return pred
+
+    def sample_rgb_patches(self, ids, pixels):
+        patch_size = getattr(self, 'point_rgb_patch_size', 5)
+        radius = patch_size // 2
+        offsets_y, offsets_x = torch.meshgrid(
+            torch.arange(-radius, radius + 1, device=self.device, dtype=torch.float32),
+            torch.arange(-radius, radius + 1, device=self.device, dtype=torch.float32)
+        )
+        offsets = torch.stack([offsets_x.reshape(-1), offsets_y.reshape(-1)], dim=-1)
+
+        ids = ids.long()
+        pixels = pixels.to(self.device)
+        patches = torch.empty((len(pixels), 3 * patch_size * patch_size), device=self.device)
+        for frame_id in torch.unique(ids):
+            mask = ids == frame_id
+            pts = pixels[mask]
+            coords = pts[:, None, :] + offsets[None]
+            coords_norm = util.normalize_coords(coords.reshape(-1, 2), self.h, self.w)
+            grid = coords_norm.reshape(1, -1, 1, 2)
+            img = self.images[int(frame_id.item())].permute(2, 0, 1)[None].to(self.device)
+            sampled = F.grid_sample(img, grid, align_corners=True, padding_mode='border')
+            sampled = sampled.reshape(3, len(pts), patch_size * patch_size).permute(1, 0, 2)
+            patches[mask] = sampled.reshape(len(pts), -1) - 0.5
+        return patches
+
+    def sample_dino_features(self, ids, pixels):
+        if self.point_dino_features is None:
+            raise ValueError('DINO features are not loaded; pass --point_use_dino_feature.')
+
+        ids = ids.long()
+        pixels = pixels.to(self.device)
+        feat_dim = int(getattr(self.args, 'point_dino_dim', 384))
+        sampled_features = torch.empty((len(pixels), feat_dim), device=self.device)
+        for frame_id in torch.unique(ids):
+            mask = ids == frame_id
+            pts = pixels[mask]
+            feat = self.point_dino_features[int(frame_id.item())].to(self.device)
+            feat_h, feat_w, actual_dim = feat.shape
+            if actual_dim != feat_dim:
+                raise ValueError('Expected DINO dim {}, got {}'.format(feat_dim, actual_dim))
+            scale = torch.tensor([(feat_w - 1.) / (self.w - 1.),
+                                  (feat_h - 1.) / (self.h - 1.)], device=self.device)
+            feat_coords = pts * scale
+            coords_norm = util.normalize_coords(feat_coords, feat_h, feat_w)
+            grid = coords_norm.reshape(1, -1, 1, 2)
+            feat_chw = feat.permute(2, 0, 1)[None]
+            sampled = F.grid_sample(feat_chw, grid, align_corners=True, padding_mode='border')
+            values = sampled.reshape(actual_dim, len(pts)).permute(1, 0)
+            if bool(getattr(self.args, 'point_dino_l2_normalize', False)):
+                values = F.normalize(values, p=2, dim=-1)
+            sampled_features[mask] = values
+        return sampled_features
+
+    def get_dino_correlation_features(self, ids1, src_pixels, ids2, base_pixels):
+        radius = max(int(getattr(self.args, 'point_corr_radius', 12)), 0)
+        stride = max(int(getattr(self.args, 'point_corr_stride', 2)), 1)
+        offsets_y, offsets_x = torch.meshgrid(
+            torch.arange(-radius, radius + 1, stride, device=self.device, dtype=torch.float32),
+            torch.arange(-radius, radius + 1, stride, device=self.device, dtype=torch.float32)
+        )
+        offsets = torch.stack([offsets_x.reshape(-1), offsets_y.reshape(-1)], dim=-1)
+
+        src_dino = F.normalize(self.sample_dino_features(ids1, src_pixels), p=2, dim=-1)
+        target_pixels = base_pixels[:, None, :] + offsets[None]
+        n_pts, n_offsets = target_pixels.shape[:2]
+        target_ids = ids2[:, None].expand(n_pts, n_offsets).reshape(-1)
+        target_dino = self.sample_dino_features(target_ids, target_pixels.reshape(-1, 2))
+        target_dino = F.normalize(target_dino, p=2, dim=-1).reshape(n_pts, n_offsets, -1)
+
+        corr = torch.sum(src_dino[:, None, :] * target_dino, dim=-1)
+        temperature = float(getattr(self.args, 'point_corr_temperature', 10.0))
+        weights = F.softmax(corr * temperature, dim=-1)
+        delta_px = torch.sum(weights[..., None] * offsets[None], dim=1)
+        corr_pred = base_pixels + delta_px
+
+        denom = float(radius) if radius > 0 else 1.0
+        corr_feat = torch.cat([corr, delta_px / denom], dim=-1)
+        return corr_feat, corr_pred
+
+    def _sample_keypoint_training_pairs(self):
+        if not self.with_keypoints:
+            return None
+
+        num_pairs = max(int(getattr(self.args, 'point_num_pairs', 8)), 1)
+        max_interval = int(getattr(self.args, 'point_max_interval', 0))
+        min_conf = getattr(self.args, 'min_keypoint_conf', 0.5)
+        ids1, ids2, pts1, pts2 = [], [], [], []
+        attempts = max(num_pairs * 20, 40)
+        for _ in range(attempts):
+            if len(ids1) >= num_pairs:
+                break
+            id1 = int(torch.randint(0, self.num_imgs, (1,), device=self.device).item())
+            if max_interval > 0:
+                low = max(0, id1 - max_interval)
+                high = min(self.num_imgs - 1, id1 + max_interval)
+                if low == high:
+                    continue
+                candidates = [i for i in range(low, high + 1) if i != id1]
+                id2 = int(candidates[torch.randint(0, len(candidates), (1,), device=self.device).item()])
+            else:
+                id2 = int(torch.randint(0, self.num_imgs - 1, (1,), device=self.device).item())
+                if id2 >= id1:
+                    id2 += 1
+
+            valid = self.keypoint_valid[id1] & self.keypoint_valid[id2] & \
+                    (self.keypoint_confidences[id1] >= min_conf) & \
+                    (self.keypoint_confidences[id2] >= min_conf)
+            if valid.sum() == 0:
+                continue
+            ids1.append(torch.full((int(valid.sum()),), id1, dtype=torch.long, device=self.device))
+            ids2.append(torch.full((int(valid.sum()),), id2, dtype=torch.long, device=self.device))
+            pts1.append(self.keypoints[id1][valid])
+            pts2.append(self.keypoints[id2][valid])
+
+        if not pts1:
+            return None
+        return torch.cat(ids1), torch.cat(pts1), torch.cat(ids2), torch.cat(pts2)
+
+    def _get_flow_point_training_pairs(self, batch):
+        ids1 = torch.as_tensor(batch['ids1'], dtype=torch.long, device=self.device)
+        ids2 = torch.as_tensor(batch['ids2'], dtype=torch.long, device=self.device)
+        pts1 = batch['pts1'].to(self.device)
+        pts2 = batch['pts2'].to(self.device)
+        weights = batch.get('weights', None)
+        if weights is not None:
+            weights = weights.to(self.device)
+            valid = weights.squeeze(-1) > 0
+        else:
+            valid = torch.ones(pts1.shape[:-1], dtype=torch.bool, device=self.device)
+
+        if pts1.ndim == 3:
+            n_pair, n_pts = pts1.shape[:2]
+            ids1 = ids1.repeat_interleave(n_pts)
+            ids2 = ids2.repeat_interleave(n_pts)
+            pts1 = pts1.reshape(-1, 2)
+            pts2 = pts2.reshape(-1, 2)
+            valid = valid.reshape(-1)
+
+        if valid.sum() == 0:
+            return None
+        return ids1[valid], pts1[valid], ids2[valid], pts2[valid]
+
+    def compute_point_tracking_loss(self, batch=None):
+        supervision = getattr(self.args, 'point_supervision', 'flow')
+        if supervision == 'flow':
+            samples = self._get_flow_point_training_pairs(batch)
+        elif supervision == 'keypoints':
+            samples = self._sample_keypoint_training_pairs()
+        else:
+            raise ValueError('Unknown point_supervision: {}'.format(supervision))
+        if samples is None:
+            return torch.tensor(0., device=self.device), {}
+
+        ids1, pts1, ids2, pts2 = samples
+        pred, conf_logit = self.get_point_head_correspondences(ids1, pts1, ids2, return_conf=True)
+        pred_norm = util.normalize_coords(pred, self.h, self.w)
+        target_norm = util.normalize_coords(pts2, self.h, self.w)
+        xy_loss = F.smooth_l1_loss(pred_norm, target_norm)
+        conf_loss = F.binary_cross_entropy_with_logits(conf_logit, torch.ones_like(conf_logit))
+        loss = xy_loss + getattr(self.args, 'point_conf_weight', 0.01) * conf_loss
+        stats = {
+            'loss_point_xy': xy_loss.item(),
+            'loss_point_conf': conf_loss.item(),
+            'num_point_samples': float(len(pts1)),
+        }
+        return loss, stats
+
     def compute_scene_flow_smoothness_loss(self, ids, xs):
         mask_valid = (ids >= 1) * (ids < self.num_imgs - 1)
         ids = ids[mask_valid]
@@ -543,6 +858,12 @@ class BaseTrainer():
                                                   w_distortion=w_distortion,
                                                   w_flow_grad=w_flow_grad,
                                                   return_data=True)
+        if self.use_point_head and getattr(self.args, 'point_loss_weight', 0.) > 0:
+            point_loss, point_stats = self.compute_point_tracking_loss(batch)
+            loss = loss + getattr(self.args, 'point_loss_weight', 1.0) * point_loss
+            self.scalars_to_log['loss/loss_point'] = point_loss.item()
+            for k, v in point_stats.items():
+                self.scalars_to_log['loss/{}'.format(k)] = v
 
         if torch.isnan(loss):
             pdb.set_trace()
@@ -579,6 +900,31 @@ class BaseTrainer():
         self.scalars_to_log['time'] = time.time() - start
         self.ids1 = flow_data['ids1']
         self.ids2 = flow_data['ids2']
+
+
+    def get_keypoints_for_frame(self, frame_id, min_conf=None, mask=None):
+        if not self.with_keypoints:
+            raise ValueError('No keypoints loaded for {}'.format(self.seq_dir))
+        if min_conf is None:
+            min_conf = getattr(self.args, 'min_keypoint_conf', 0.5)
+
+        valid = self.keypoint_valid[frame_id] & (self.keypoint_confidences[frame_id] >= min_conf)
+        pts = self.keypoints[frame_id][valid]
+        if mask is not None:
+            if not torch.is_tensor(mask):
+                mask = torch.from_numpy(mask).bool().to(self.device)
+            if len(pts) == 0:
+                return pts
+            x = pts[:, 0].round().long()
+            y = pts[:, 1].round().long()
+            in_bounds = (x >= 0) & (x < self.w) & (y >= 0) & (y < self.h)
+            if in_bounds.any():
+                keep = torch.zeros_like(in_bounds)
+                keep[in_bounds] = mask[y[in_bounds], x[in_bounds]]
+                pts = pts[keep]
+            else:
+                pts = pts[:0]
+        return pts
 
     def sample_pts_within_mask(self, mask, num_pts, return_normed=False, seed=None,
                                use_mask=False, reverse_mask=False, regular=False, interval=10):
@@ -652,16 +998,19 @@ class BaseTrainer():
         np.save(os.path.join(save_dir, '{:06d}{}.npy'.format(self.step, suffix)), out)
 
     def vis_pairwise_correspondences(self, ids=None, num_pts=200, use_mask=False, use_max_loc=True,
-                                     reverse_mask=False, regular=True, interval=20):
+                                     reverse_mask=False, regular=True, interval=20, use_keypoints=False):
         if ids is not None:
             id1, id2 = ids
         else:
             id1 = self.ids1[0]
             id2 = self.ids2[0]
 
-        px1s = self.sample_pts_within_mask(self.masks[id1], num_pts, seed=1234,
-                                           use_mask=use_mask, reverse_mask=reverse_mask,
-                                           regular=regular, interval=interval)
+        if use_keypoints:
+            px1s = self.get_keypoints_for_frame(id1)
+        else:
+            px1s = self.sample_pts_within_mask(self.masks[id1], num_pts, seed=1234,
+                                               use_mask=use_mask, reverse_mask=reverse_mask,
+                                               regular=regular, interval=interval)
         num_pts = len(px1s)
 
         with torch.no_grad():
@@ -681,6 +1030,79 @@ class BaseTrainer():
                           fontFace=cv2.FONT_HERSHEY_SIMPLEX, thickness=2)
         out = util.uint82float(out)
         return out
+
+
+    def plot_correspondences_for_pixels_rolling(self, query_kpt, query_id, num_pts=200,
+                                                vis_occlusion=False,
+                                                occlusion_th=0.95,
+                                                use_max_loc=False,
+                                                radius=2,
+                                                return_kpts=False):
+        frames = []
+        img_query = self.images[query_id].cpu().numpy()
+        positions = [None] * self.num_imgs
+        occluded = [None] * self.num_imgs
+        positions[query_id] = query_kpt
+        occluded[query_id] = torch.zeros_like(query_kpt[..., :1], dtype=torch.bool)
+    
+        with torch.no_grad():
+            curr_pos = query_kpt
+            curr_occ = torch.zeros_like(query_kpt[..., :1], dtype=torch.bool)
+            for tgt_id in range(query_id + 1, self.num_imgs):
+                src_id = tgt_id - 1
+                if vis_occlusion:
+                    next_pos, occ_score = self.get_correspondences_and_occlusion_masks_for_pixels(
+                        [src_id], curr_pos[None], [tgt_id], use_max_loc=use_max_loc)
+                    next_pos = next_pos[0]
+                    next_occ = occ_score[0] > occlusion_th
+                    curr_occ = curr_occ | next_occ
+                else:
+                    if getattr(self.args, 'use_point_head_for_query', False) and self.use_point_head:
+                        next_pos = self.get_point_head_correspondences([src_id], curr_pos[None], [tgt_id])[0]
+                    else:
+                        next_pos = self.get_correspondences_for_pixels([src_id], curr_pos[None], [tgt_id],
+                                                                       use_max_loc=use_max_loc)[0]
+                positions[tgt_id] = next_pos
+                occluded[tgt_id] = curr_occ.clone()
+                curr_pos = next_pos
+    
+            curr_pos = query_kpt
+            curr_occ = torch.zeros_like(query_kpt[..., :1], dtype=torch.bool)
+            for tgt_id in range(query_id - 1, -1, -1):
+                src_id = tgt_id + 1
+                if vis_occlusion:
+                    next_pos, occ_score = self.get_correspondences_and_occlusion_masks_for_pixels(
+                        [src_id], curr_pos[None], [tgt_id], use_max_loc=use_max_loc)
+                    next_pos = next_pos[0]
+                    next_occ = occ_score[0] > occlusion_th
+                    curr_occ = curr_occ | next_occ
+                else:
+                    if getattr(self.args, 'use_point_head_for_query', False) and self.use_point_head:
+                        next_pos = self.get_point_head_correspondences([src_id], curr_pos[None], [tgt_id])[0]
+                    else:
+                        next_pos = self.get_correspondences_for_pixels([src_id], curr_pos[None], [tgt_id],
+                                                                       use_max_loc=use_max_loc)[0]
+                positions[tgt_id] = next_pos
+                occluded[tgt_id] = curr_occ.clone()
+                curr_pos = next_pos
+    
+        kpts = []
+        for frame_id in range(self.num_imgs):
+            kp_i = positions[frame_id]
+            mask = None
+            if vis_occlusion:
+                occ = occluded[frame_id]
+                kp_i = torch.cat([kp_i, occ.float()], dim=-1)
+                mask = occ.squeeze(-1).cpu().numpy()
+            img_i = self.images[frame_id].cpu().numpy()
+            out = util.drawMatches(img_query, img_i, query_kpt.cpu().numpy(), kp_i.cpu().numpy(),
+                                   num_vis=num_pts, mask=mask, radius=radius)
+            frames.append(out)
+            kpts.append(kp_i)
+        kpts = torch.stack(kpts, dim=0)
+        if return_kpts:
+            return frames, kpts
+        return frames
 
     def plot_correspondences_for_pixels(self, query_kpt, query_id, num_pts=200,
                                         vis_occlusion=False,
@@ -711,8 +1133,11 @@ class BaseTrainer():
                     if id == query_id:
                         kp_i = query_kpt
                     else:
-                        kp_i = self.get_correspondences_for_pixels([query_id], query_kpt[None], [id],
-                                                                   use_max_loc=use_max_loc)[0]
+                        if getattr(self.args, 'use_point_head_for_query', False) and self.use_point_head:
+                            kp_i = self.get_point_head_correspondences([query_id], query_kpt[None], [id])[0]
+                        else:
+                            kp_i = self.get_correspondences_for_pixels([query_id], query_kpt[None], [id],
+                                                                       use_max_loc=use_max_loc)[0]
                     mask = None
                 img_i = self.images[id].cpu().numpy()
                 out = util.drawMatches(img_query, img_i, query_kpt.cpu().numpy(), kp_i.cpu().numpy(),
@@ -727,24 +1152,36 @@ class BaseTrainer():
     def eval_video_correspondences(self, query_id, pts=None, num_pts=200, seed=1234, use_mask=False,
                                    mask=None, reverse_mask=False, vis_occlusion=False, occlusion_th=0.99,
                                    use_max_loc=False, regular=True,
-                                   interval=10, radius=2, return_kpts=False):
+                                   interval=10, radius=2, return_kpts=False, use_keypoints=False,
+                                   rolling_query=False):
         with torch.no_grad():
+            mask_tensor = None
             if mask is not None:
-                mask = torch.from_numpy(mask).bool().to(self.device)
-            else:
-                mask = self.masks[query_id]
+                mask_tensor = torch.from_numpy(mask).bool().to(self.device)
+            elif use_mask:
+                mask_tensor = self.masks[query_id]
 
             if pts is None:
-                x_0 = self.sample_pts_within_mask(mask, num_pts, seed=seed, use_mask=use_mask,
-                                                  reverse_mask=reverse_mask, regular=regular, interval=interval)
-                num_pts = 1e7 if regular else num_pts
+                query_source = getattr(self.args, 'query_pts_source', 'mask')
+                use_keypoints = use_keypoints or (query_source == 'keypoints' and not use_mask)
+                if use_keypoints:
+                    x_0 = self.get_keypoints_for_frame(query_id, mask=mask_tensor)
+                    if len(x_0) == 0:
+                        raise ValueError('No valid keypoints found for frame {}'.format(query_id))
+                    num_pts = len(x_0)
+                else:
+                    sample_mask = mask_tensor if mask_tensor is not None else self.masks[query_id]
+                    x_0 = self.sample_pts_within_mask(sample_mask, num_pts, seed=seed, use_mask=use_mask,
+                                                      reverse_mask=reverse_mask, regular=regular, interval=interval)
+                    num_pts = 1e7 if regular else num_pts
             else:
                 x_0 = torch.from_numpy(pts).float().to(self.device)
-            return self.plot_correspondences_for_pixels(x_0, query_id, num_pts=num_pts,
-                                                        vis_occlusion=vis_occlusion,
-                                                        occlusion_th=occlusion_th,
-                                                        use_max_loc=use_max_loc,
-                                                        radius=radius, return_kpts=return_kpts)
+            plot_fn = self.plot_correspondences_for_pixels_rolling if rolling_query else self.plot_correspondences_for_pixels
+            return plot_fn(x_0, query_id, num_pts=num_pts,
+                           vis_occlusion=vis_occlusion,
+                           occlusion_th=occlusion_th,
+                           use_max_loc=use_max_loc,
+                           radius=radius, return_kpts=return_kpts)
 
     def get_pred_depth_maps(self, ids, chunk_size=40000):
         grid = self.grid[..., :2].reshape(-1, 2)
@@ -943,6 +1380,8 @@ class BaseTrainer():
                 print('Saving checkpoints at {} to {}...'.format(step, self.out_dir))
                 fpath = os.path.join(self.out_dir, 'model_{:06d}.pth'.format(step))
                 self.save_model(fpath)
+                if getattr(self.args, 'skip_checkpoint_visualization', False):
+                    return
 
                 vis_dir = os.path.join(self.out_dir, 'vis')
                 os.makedirs(vis_dir, exist_ok=True)
@@ -1018,6 +1457,8 @@ class BaseTrainer():
                    'color_mlp': de_parallel(self.color_mlp).state_dict(),
                    'num_imgs': self.num_imgs
                    }
+        if self.use_point_head:
+            to_save['point_head'] = de_parallel(self.point_head).state_dict()
         torch.save(to_save, filename)
 
     def load_model(self, filename, load_opt=True, load_scheduler=True):
@@ -1027,13 +1468,23 @@ class BaseTrainer():
             to_load = torch.load(filename)
 
         if load_opt:
-            self.optimizer.load_state_dict(to_load['optimizer'])
+            try:
+                self.optimizer.load_state_dict(to_load['optimizer'])
+            except ValueError as err:
+                print('Skipping optimizer state because it is incompatible with the current parameter groups: {}'.format(err))
         if load_scheduler:
-            self.scheduler.load_state_dict(to_load['scheduler'])
+            try:
+                self.scheduler.load_state_dict(to_load['scheduler'])
+            except ValueError as err:
+                print('Skipping scheduler state because it is incompatible with the current parameter groups: {}'.format(err))
 
         self.deform_mlp.load_state_dict(to_load['deform_mlp'])
         self.feature_mlp.load_state_dict(to_load['feature_mlp'])
         self.color_mlp.load_state_dict(to_load['color_mlp'])
+        if self.use_point_head and 'point_head' in to_load:
+            de_parallel(self.point_head).load_state_dict(to_load['point_head'])
+        elif self.use_point_head:
+            print('Point head enabled, but checkpoint has no point_head weights; initializing point head from scratch.')
         self.num_imgs = to_load['num_imgs']
 
     def load_from_ckpt(self, out_folder,

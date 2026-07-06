@@ -1,0 +1,162 @@
+import os
+import sys
+import argparse
+import imageio
+import glob
+import numpy as np
+import torch
+import cv2
+
+from config import config_parser
+from trainer import BaseTrainer
+from matplotlib import cm
+import warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+color_map = cm.get_cmap("jet")
+
+
+def vis_single_point_trail(images, kpts, save_path, fps=10):
+    num_imgs, num_pts = kpts.shape[:2]
+    frames = []
+
+    for i in range(num_imgs):
+        img_curr = images[i].copy()
+
+        for t in range(i):
+            img1 = img_curr.copy()
+            alpha = max(1 - 0.9 * ((i - t) / ((i + 1) * .99)), 0.1)
+
+            for j in range(num_pts):
+                pt1 = kpts[t, j]
+                pt2 = kpts[t + 1, j]
+                p1 = (int(round(pt1[0])), int(round(pt1[1])))
+                p2 = (int(round(pt2[0])), int(round(pt2[1])))
+                cv2.line(img1, p1, p2, (0, 0, 255), thickness=2, lineType=16)  # Red color
+
+            img_curr = cv2.addWeighted(img1, alpha, img_curr, 1 - alpha, 0)
+
+        for j in range(num_pts):
+            pt = kpts[i, j]
+            p = (int(round(pt[0])), int(round(pt[1])))
+            cv2.circle(img_curr, p, 6, (0, 0, 255), -1, lineType=16)  # Red color, larger radius
+
+        frames.append(img_curr)
+
+    imageio.mimwrite(save_path, frames, quality=8, fps=fps)
+    print("Video saved to " + save_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize point tracking from .pth checkpoint")
+    parser.add_argument("--ckpt_path", type=str, required=True, help="Path to .pth checkpoint file")
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to video sequence directory")
+    parser.add_argument("--points", type=str, required=True,
+                        help="Points to track: x1,y1 x2,y2 or N to sample N random points")
+    parser.add_argument("--query_frame_id", type=int, default=0, help="Query frame ID")
+    parser.add_argument("--output", type=str, default="output.mp4", help="Output video path")
+    parser.add_argument("--use_max_loc", action="store_true", help="Use max location")
+    parser.add_argument("--vis_occlusion", action="store_true", help="Visualize occlusion")
+    parser.add_argument("--occlusion_th", type=float, default=0.99, help="Occlusion threshold")
+    parser.add_argument("--fps", type=int, default=10, help="Output video fps")
+
+    args = parser.parse_args()
+
+    # Parse points
+    if args.points.replace("-", "").replace(".", "").replace(" ", "").isdigit():
+        num_pts = int(args.points)
+        pts = None
+        print("Will sample " + str(num_pts) + " random points")
+    else:
+        point_strs = args.points.split()
+        pts = []
+        for ps in point_strs:
+            coords = ps.split(",")
+            if len(coords) == 2:
+                x, y = float(coords[0]), float(coords[1])
+                pts.append([x, y])
+        pts = np.array(pts)
+        num_pts = len(pts)
+        print("Tracking " + str(num_pts) + " points: " + str(pts))
+
+    class SimpleArgs:
+        def __init__(self):
+            self.data_dir = args.data_dir
+            self.expname = "test"
+            self.save_dir = "out/"
+            self.ckpt_path = args.ckpt_path
+            self.no_reload = False
+            self.distributed = 0
+            self.local_rank = 0
+            self.load_opt = 0
+            self.load_scheduler = 0
+            self.lr_feature = 1e-3
+            self.lr_deform = 1e-4
+            self.lr_color = 3e-4
+            self.lrate_decay_steps = 20000
+            self.lrate_decay_factor = 0.5
+            self.pe_freq = 4
+            self.use_affine = True
+            self.chunk_size = 40000
+            self.use_max_loc = args.use_max_loc
+            self.query_frame_id = args.query_frame_id
+            self.vis_occlusion = args.vis_occlusion
+            self.occlusion_th = args.occlusion_th
+            self.num_imgs = 250
+            self.num_samples_ray = 32
+            self.min_depth = 0
+            self.max_depth = 2
+            self.grad_clip = 0
+            self.mask_near = False
+            self.max_padding = 0
+            self.use_error_map = False
+            self.foreground_mask_path = ""
+            self.start_interval = 20
+
+    simple_args = SimpleArgs()
+
+    print("Loading checkpoint from " + args.ckpt_path)
+    trainer = BaseTrainer(simple_args)
+    print("Loaded model with " + str(trainer.num_imgs) + " images")
+
+    # Get original images
+    img_dir = os.path.join(args.data_dir, "color")
+    img_files = sorted(list(glob.glob(os.path.join(img_dir, "*"))))
+    images = np.array([imageio.imread(img_file) for img_file in img_files])
+    print("Loaded " + str(len(images)) + " images")
+
+    print("Running point tracking...")
+    if pts is not None:
+        frames, kpts = trainer.eval_video_correspondences(
+            args.query_frame_id,
+            pts=pts,
+            num_pts=num_pts,
+            use_max_loc=args.use_max_loc,
+            vis_occlusion=args.vis_occlusion,
+            occlusion_th=args.occlusion_th,
+            radius=2,
+            return_kpts=True
+        )
+    else:
+        frames, kpts = trainer.eval_video_correspondences(
+            args.query_frame_id,
+            num_pts=num_pts,
+            use_max_loc=args.use_max_loc,
+            vis_occlusion=args.vis_occlusion,
+            occlusion_th=args.occlusion_th,
+            radius=2,
+            return_kpts=True
+        )
+
+    # Save correspondence visualization
+    imageio.mimwrite(args.output, frames, quality=8, fps=args.fps)
+    print("Correspondence video saved to " + args.output)
+
+    # Save point trail visualization
+    kpts = kpts.cpu().numpy()
+    trail_output = args.output.replace(".mp4", "_trails.mp4")
+    vis_single_point_trail(images, kpts, trail_output, fps=args.fps)
+
+
+if __name__ == "__main__":
+    main()
