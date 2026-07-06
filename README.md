@@ -11,13 +11,17 @@
 
 ### 2. 点跟踪头部网络 (Point Tracking Head)
 
-- **`networks/point_head.py`**: 新增 `PointMLPHead` 模块，一个可训练的 MLP 头部网络，在 OmniMotion 底层对应关系基础上预测残差修正
+- **`networks/point_head.py`**：新增 `PointMLPHead` 模块。该模块作为 OmniMotion correspondence 预测之后的可训练残差修正头，在 OmniMotion 给出的初始对应点基础上预测二维残差偏移，从而细化最终点位置。
 - 支持多种辅助特征输入：
-  - **RGB 图像块特征** (`--point_use_rgb_patch`)：在源点和目标点周围采样 RGB 块
-  - **DINO 特征** (`--point_use_dino_feature`)：使用 DINO 自监督视觉特征
-  - **DINO 相关特征** (`--point_use_dino_correlation`)：在局部窗口内计算 DINO 特征的余弦相似度热力图，通过 soft-argmax 得到亚像素偏移
-- 支持从 RAFT flow 或者关键点标注两种监督方式 (`--point_supervision`)
-- 训练时可联合 OmniMotion 一起优化，也可独立加载进行推理
+  - **RGB 图像块特征** (`--point_use_rgb_patch`)：在源点和 OmniMotion/局部匹配预测的目标点周围采样 RGB patch，并输入 point head 进行残差回归。
+  - **DINO 特征** (`--point_use_dino_feature`)：将源点与目标点的 DINO 特征及其差异作为辅助输入。该直接拼接方式已作为对比实验验证，但效果不如局部相关性方法。
+  - **DINO 相关特征** (`--point_use_dino_correlation`)：以 OmniMotion 预测点为中心，在局部窗口内计算源点 DINO 特征与目标候选点 DINO 特征的余弦相似度热力图，并通过 soft-argmax 得到局部偏移，用于更新目标点位置并辅助 point head 预测最终残差。
+- 监督方式：
+  - 代码接口支持 `RAFT flow` 与 `keypoints` 两种监督来源 (`--point_supervision`)。
+  - 本文有效实验中仅使用 RAFT flow 伪标签训练 point head，人工关键点 GT 不参与训练，仅用于最终评估。
+- 训练与推理：
+  - point head 可与 OmniMotion 主体联合优化。
+  - 推理时，point head 依赖 OmniMotion 的初始 correspondence 结果，并作为其后的残差细化模块使用，而不是独立替代 OmniMotion 完成点跟踪。
 
 ### 3. 滚动查询模式 (Rolling Query)
 
